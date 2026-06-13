@@ -1,0 +1,116 @@
+name: YouTube to Shorts
+
+# Two ways to run:
+#  1. Actions tab -> "YouTube to Shorts" -> Run workflow -> paste a URL (+ optional clip cutting).
+#  2. Add a URL line to videos/queue.txt and push -> every new URL gets processed.
+on:
+  workflow_dispatch:
+    inputs:
+      youtube_url:
+        description: "YouTube URL (your own video)"
+        required: true
+      make_clips:
+        description: "Also cut 9:16 clips (slower; downloaded as artifacts)"
+        type: boolean
+        default: false
+  push:
+    paths:
+      - "videos/queue.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  shorts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install yt-dlp + ffmpeg
+        run: |
+          python -m pip install -U yt-dlp
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Resolve URLs to process
+        id: urls
+        run: |
+          if [ -n "${{ github.event.inputs.youtube_url }}" ]; then
+            echo "${{ github.event.inputs.youtube_url }}" > /tmp/urls.txt
+          else
+            # On push: process only URLs not yet reviewed (no matching reviews/<id>.md)
+            : > /tmp/urls.txt
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              case "$line" in \#*) continue;; esac
+              id=$(python -m yt_dlp --skip-download --print "%(id)s" "$line" 2>/dev/null | tail -1)
+              if [ -n "$id" ] && [ ! -f "reviews/$id.md" ]; then echo "$line" >> /tmp/urls.txt; fi
+            done < videos/queue.txt || true
+          fi
+          echo "count=$(wc -l < /tmp/urls.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+          cat /tmp/urls.txt
+
+      - name: Analyze each video
+        if: steps.urls.outputs.count != '0'
+        run: |
+          mkdir -p reviews clips work
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            echo "::group::$url"
+            python -m yt_dlp --skip-download --dump-single-json "$url" > work/meta.json || { echo "meta failed"; continue; }
+            id=$(python -c "import json;print(json.load(open('work/meta.json'))['id'])")
+            # auto-captions (English), VTT
+            python -m yt_dlp --skip-download --write-auto-subs --write-subs \
+              --sub-langs "en.*" --sub-format vtt -o "work/$id.%(ext)s" "$url" || true
+            vtt=$(ls work/$id*.vtt 2>/dev/null | head -1)
+            if [ -z "$vtt" ]; then echo "no captions for $id"; vtt=/dev/null; fi
+            python analyze.py "$vtt" work/meta.json reviews
+
+            if [ "${{ github.event.inputs.make_clips }}" = "true" ] && [ -f "reviews/$id.clips.json" ]; then
+              python -m yt_dlp -f "bv*[height<=1080]+ba/b[height<=1080]" -o "work/$id.mp4" "$url" || true
+              if [ -f "work/$id.mp4" ]; then
+                python - "$id" <<'PY'
+import json, subprocess, sys, pathlib
+vid = sys.argv[1]
+clips = json.load(open(f"reviews/{vid}.clips.json"))
+pathlib.Path("clips").mkdir(exist_ok=True)
+for i, c in enumerate(clips, 1):
+    out = f"clips/{vid}_short{i}.mp4"
+    # cut, then crop/scale center to vertical 1080x1920
+    subprocess.run([
+        "ffmpeg","-y","-ss",str(c["start"]),"-to",str(c["end"]),"-i",f"work/{vid}.mp4",
+        "-vf","crop='min(iw,ih*9/16)':'min(ih,iw*16/9)',scale=1080:1920,setsar=1",
+        "-c:v","libx264","-preset","veryfast","-c:a","aac",out
+    ], check=False)
+    print("cut", out)
+PY
+              fi
+            fi
+            echo "::endgroup::"
+          done < /tmp/urls.txt
+
+      - name: Upload clips (if any)
+        if: steps.urls.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: shorts-clips
+          path: clips/*.mp4
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Commit reviews
+        if: steps.urls.outputs.count != '0'
+        run: |
+          git config user.name "Shubham Safaya"
+          git config user.email "safayashubham@gmail.com"
+          git add reviews/
+          if git diff --staged --quiet; then
+            echo "No new reviews."
+          else
+            git commit -m "Shorts plan + review for new video(s)"
+            git push
+          fi

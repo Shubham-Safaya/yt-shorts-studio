@@ -1,0 +1,5 @@
+# YouTube to Shorts queue
+# Add one of YOUR YouTube video URLs per line, then commit/push.
+# The GitHub Action turns each new link into a Shorts Plan in reviews/.
+# Lines starting with # are ignored. Example:
+# https://www.youtube.com/watch?v=YOUR_VIDEO_ID
