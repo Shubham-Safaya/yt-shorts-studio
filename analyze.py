@@ -13,8 +13,10 @@ If an optional clipper step runs (ffmpeg), these timestamps drive the cuts.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 # Signals that a sentence is "clippable" — hooks, stakes, specifics, emotion.
@@ -136,12 +138,62 @@ def caption(text: str, idx: int) -> str:
     return f"{hook}\n\n{cta}\n\n{tags}"
 
 
-def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[dict]) -> str:
+def claude_enhance(candidates: list[dict], title: str) -> list[dict] | None:
+    """Optional: if ANTHROPIC_API_KEY is set, let Claude pick the best clips and
+    write punchier hooks + captions. Returns enhanced picks, or None to fall back
+    to the heuristic. Pure stdlib HTTP so the Action needs no extra dependency."""
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not key or not candidates:
+        return None
+    model = os.getenv("SHORTS_MODEL", "claude-opus-4-8").strip()
+    items = [{"i": i, "start": round(c["start"], 1), "end": round(c["end"], 1),
+              "text": c["text"][:600]} for i, c in enumerate(candidates)]
+    system = (
+        "You are an elite short-form video editor who turns long talks into viral "
+        "Shorts/Reels for a tech-career creator. From the candidate transcript moments, "
+        "choose the 5 BEST standalone clips (each must make sense alone and have a strong "
+        "hook in the first 2 seconds). For each, write a punchy on-screen hook (<=70 chars) "
+        "and a caption (1-2 lines + a question), then 6-8 relevant hashtags. "
+        "Never use em dashes anywhere; use commas or periods. "
+        'Return ONLY JSON: {"picks":[{"i":<index>,"hook":"...","caption":"...","hashtags":"#a #b"}]}'
+    )
+    body = json.dumps({
+        "model": model, "max_tokens": 1500, "system": system,
+        "messages": [{"role": "user",
+                      "content": f"Video: {title}\nCandidates:\n{json.dumps(items, ensure_ascii=False)}"}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=body,
+        headers={"content-type": "application/json", "x-api-key": key,
+                 "anthropic-version": "2023-06-01"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read())
+        if data.get("stop_reason") == "refusal":
+            return None
+        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+        parsed = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
+        out = []
+        for p in parsed.get("picks", [])[:5]:
+            c = candidates[int(p["i"])]
+            cap = p.get("caption", "").strip()
+            tags = p.get("hashtags", "").strip()
+            out.append({**c, "hook": p.get("hook", "").strip(),
+                        "caption": (cap + ("\n\n" + tags if tags else "")).strip()})
+        out.sort(key=lambda w: w["start"])
+        return out or None
+    except Exception as e:
+        print(f"(Claude enhance skipped: {e})")
+        return None
+
+
+def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[dict], smart: bool) -> str:
     L = [
         f"# Shorts Plan — {title}",
         "",
         f"- **Source:** [{url}]({url}) · `{video_id}`",
         f"- **Length:** {fmt(dur_s)} · **Candidate clips found:** {len(picks)}",
+        f"- **Selection:** {'Claude-picked (best-quality)' if smart else 'heuristic (set ANTHROPIC_API_KEY for Claude-picked clips)'}.",
         "- **Use:** cut these 9:16 (1080x1920), burn captions, hook in the first 2 seconds.",
         "- *Generated from auto-captions; tighten the exact in/out points by eye.*",
         "",
@@ -152,14 +204,14 @@ def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[di
         L += [
             f"## Clip {i}  ·  {fmt(w['start'])} → {fmt(w['end'])}  ({int(w['end']-w['start'])}s)",
             "",
-            f"**Hook (first 2s, big text):** {hook_line(w['text'])}",
+            f"**Hook (first 2s, big text):** {w.get('hook') or hook_line(w['text'])}",
             "",
             f"> {w['text']}",
             "",
             "**Caption (paste to Reels + Shorts):**",
             "",
             "```",
-            caption(w["text"], i - 1),
+            w.get("caption") or caption(w["text"], i - 1),
             "```",
             "",
             "---",
@@ -227,10 +279,15 @@ def main():
     wins = windows(cues)
     for w in wins:
         w["score"] = score(w)
-    picks = sorted(wins, key=lambda w: w["score"], reverse=True)[:5]
+    ranked = sorted(wins, key=lambda w: w["score"], reverse=True)
+
+    # Optional: let Claude choose from the top candidates and write the copy.
+    smart_picks = claude_enhance(ranked[:10], title)
+    smart = smart_picks is not None
+    picks = smart_picks if smart else ranked[:5]
     picks.sort(key=lambda w: w["start"])  # chronological in the plan
 
-    plan = build_plan(video_id, title, url, dur, picks)
+    plan = build_plan(video_id, title, url, dur, picks, smart)
     review = build_review(title, dur, cues, picks)
     (out_dir / f"{video_id}.md").write_text(review + "\n---\n\n" + plan)
 
