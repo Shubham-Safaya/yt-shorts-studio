@@ -25,6 +25,15 @@ Add an `ANTHROPIC_API_KEY` repo secret (Settings → Secrets → Actions). When 
 
 `analyze.py` (pure standard library, no API key) parses the video's auto-captions, groups them into ~40-second windows, and scores each on hooks, specifics (numbers), questions, and emotion to pick the most clippable moments. The workflow fetches captions + metadata with `yt-dlp` and cuts clips with `ffmpeg`.
 
+## YouTube blocks CI runners (important)
+
+YouTube increasingly challenges GitHub Actions' datacenter IPs with *"Sign in to confirm you're not a bot,"* so `yt-dlp` can fail to fetch captions from the cloud. Two ways around it, in order of robustness:
+
+1. **Transcript drop (bulletproof, for your own videos):** In YouTube Studio → your video → Subtitles → download the English `.srt`. Save it as `transcripts/<video_id>.srt` (the id is the 11 chars after `v=` or `youtu.be/`), commit, and run the workflow. The pipeline uses the dropped transcript and never touches YouTube — no bot wall.
+2. **Cookies secret:** Export your YouTube cookies (a `cookies.txt` from a logged-in browser via a "Get cookies.txt" extension) and paste the file contents into a repo secret named `YOUTUBE_COOKIES`. The workflows pass `--cookies` automatically. Cookies expire, so refresh when fetches start failing.
+
+If neither is set and YouTube blocks the runner, the run still succeeds but prints exactly what to do instead of silently producing nothing.
+
 ## Honest limits
 
 - **Use it on your own videos.** Downloading and re-cutting content you own is fine; this is built for that.

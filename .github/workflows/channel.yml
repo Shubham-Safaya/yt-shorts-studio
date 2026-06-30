@@ -37,11 +37,21 @@ jobs:
           python -m pip install -U yt-dlp
           sudo apt-get update && sudo apt-get install -y ffmpeg
 
+      - name: Prepare YouTube cookies (optional, defeats the bot wall)
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            printf '%s' "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+            echo "cookies.txt written"
+          else
+            echo "No YOUTUBE_COOKIES secret — relying on transcripts/ drops if YouTube blocks the runner."
+          fi
+
       - name: List recent channel videos (skip already-reviewed)
         id: list
         run: |
           N="${{ github.event.inputs.max_videos }}"
-          python -m yt_dlp --flat-playlist --print id -I "1:$N" \
+          COOKIES=""; [ -f cookies.txt ] && COOKIES="--cookies cookies.txt"
+          python -m yt_dlp $COOKIES --flat-playlist --print id -I "1:$N" \
             "${{ github.event.inputs.channel_url }}" > /tmp/ids.txt || true
           : > /tmp/urls.txt
           while IFS= read -r id; do
@@ -55,23 +65,12 @@ jobs:
         if: steps.list.outputs.count != '0'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAKE_CLIPS: ${{ github.event.inputs.make_clips }}
         run: |
-          mkdir -p reviews clips work
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             echo "::group::$url"
-            python -m yt_dlp --skip-download --dump-single-json "$url" > work/meta.json || { echo "meta failed"; continue; }
-            id=$(python -c "import json;print(json.load(open('work/meta.json'))['id'])")
-            python -m yt_dlp --skip-download --write-auto-subs --write-subs \
-              --sub-langs "en.*" --sub-format vtt -o "work/$id.%(ext)s" "$url" || true
-            vtt=$(ls work/$id*.vtt 2>/dev/null | head -1); [ -z "$vtt" ] && vtt=/dev/null
-            python analyze.py "$vtt" work/meta.json reviews
-            if [ "${{ github.event.inputs.make_clips }}" = "true" ] && [ -f "reviews/$id.clips.json" ]; then
-              python -m yt_dlp -f "bv*[height<=1080]+ba/b[height<=1080]" -o "work/$id.mp4" "$url" || true
-              if [ -f "work/$id.mp4" ]; then
-                python clip.py "$id"
-              fi
-            fi
+            bash process_video.sh "$url"
             echo "::endgroup::"
           done < /tmp/urls.txt
 

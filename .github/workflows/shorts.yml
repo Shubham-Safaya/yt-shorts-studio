@@ -36,19 +36,28 @@ jobs:
           python -m pip install -U yt-dlp
           sudo apt-get update && sudo apt-get install -y ffmpeg
 
+      - name: Prepare YouTube cookies (optional, defeats the bot wall)
+        run: |
+          if [ -n "${{ secrets.YOUTUBE_COOKIES }}" ]; then
+            printf '%s' "${{ secrets.YOUTUBE_COOKIES }}" > cookies.txt
+            echo "cookies.txt written"
+          else
+            echo "No YOUTUBE_COOKIES secret — relying on transcripts/ drops if YouTube blocks the runner."
+          fi
+
       - name: Resolve URLs to process
         id: urls
         run: |
           if [ -n "${{ github.event.inputs.youtube_url }}" ]; then
             echo "${{ github.event.inputs.youtube_url }}" > /tmp/urls.txt
           else
-            # On push: process only URLs not yet reviewed (no matching reviews/<id>.md)
+            # On push: queue lines not yet reviewed. Derive id from the URL (no network).
             : > /tmp/urls.txt
             while IFS= read -r line; do
               [ -z "$line" ] && continue
               case "$line" in \#*) continue;; esac
-              id=$(python -m yt_dlp --skip-download --print "%(id)s" "$line" 2>/dev/null | tail -1)
-              if [ -n "$id" ] && [ ! -f "reviews/$id.md" ]; then echo "$line" >> /tmp/urls.txt; fi
+              id=$(printf '%s' "$line" | grep -oP '(?:v=|youtu\.be/|/shorts/|/embed/)\K[A-Za-z0-9_-]{11}' | head -1)
+              if [ -z "$id" ] || [ ! -f "reviews/$id.md" ]; then echo "$line" >> /tmp/urls.txt; fi
             done < videos/queue.txt || true
           fi
           echo "count=$(wc -l < /tmp/urls.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
@@ -58,26 +67,12 @@ jobs:
         if: steps.urls.outputs.count != '0'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MAKE_CLIPS: ${{ github.event.inputs.make_clips }}
         run: |
-          mkdir -p reviews clips work
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             echo "::group::$url"
-            python -m yt_dlp --skip-download --dump-single-json "$url" > work/meta.json || { echo "meta failed"; continue; }
-            id=$(python -c "import json;print(json.load(open('work/meta.json'))['id'])")
-            # auto-captions (English), VTT
-            python -m yt_dlp --skip-download --write-auto-subs --write-subs \
-              --sub-langs "en.*" --sub-format vtt -o "work/$id.%(ext)s" "$url" || true
-            vtt=$(ls work/$id*.vtt 2>/dev/null | head -1)
-            if [ -z "$vtt" ]; then echo "no captions for $id"; vtt=/dev/null; fi
-            python analyze.py "$vtt" work/meta.json reviews
-
-            if [ "${{ github.event.inputs.make_clips }}" = "true" ] && [ -f "reviews/$id.clips.json" ]; then
-              python -m yt_dlp -f "bv*[height<=1080]+ba/b[height<=1080]" -o "work/$id.mp4" "$url" || true
-              if [ -f "work/$id.mp4" ]; then
-                python clip.py "$id"
-              fi
-            fi
+            bash process_video.sh "$url"
             echo "::endgroup::"
           done < /tmp/urls.txt
 
