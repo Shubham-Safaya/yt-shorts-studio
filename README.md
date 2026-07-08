@@ -41,3 +41,48 @@ If neither is set and YouTube blocks the runner, the run still succeeds but prin
 - Captions come from YouTube's auto-transcript; nudge exact in/out points by eye and let CapCut burn on-screen captions.
 
 Built by [Shubham Safaya](https://shubham-safaya.github.io).
+
+---
+
+## v2 — the local repurposing factory (`pipeline.py`)
+
+v1 (above) plans clips in GitHub Actions. **v2 produces the actual 9:16 clips** on your machine, because video processing is too heavy for CI.
+
+### One-time setup
+```bash
+# macOS
+brew install ffmpeg
+pip install yt-dlp faster-whisper
+# Linux: sudo apt install ffmpeg && pip install yt-dlp faster-whisper
+```
+Python 3.10+. First run downloads a small Whisper model (~150 MB for `base`).
+
+### Make your first 3 shorts tonight
+```bash
+python3 pipeline.py --url https://youtu.be/VIDEOID --clips 3 --style captions-big
+```
+Pipeline: **download → faster-whisper word timestamps → highlight scoring (20–58s windows) → ffmpeg 9:16 crop → burned-in big captions → hook/caption/hashtags → posting checklist.**
+
+Output: `output/<video-id>/` with `short1.mp4 … shortN.mp4`, per-clip `.json` metadata, and `POSTING_CHECKLIST.md` (upload to YT Shorts + IG Reels manually — no personal-account APIs exist; ~5 min).
+
+### Flags
+| Flag | Default | Notes |
+|---|---|---|
+| `--clips N` | 3 | how many shorts |
+| `--style` | captions-big | or `no-captions` |
+| `--crop` | center | or `face` (needs mediapipe; falls back to centre) |
+| `--model` | base | whisper size: tiny/base/small/medium |
+| `--transcript words.json` | — | skip download+whisper (bot-wall bypass; JSON = `[{"w","start","end"}]`) |
+| `--dry-run` | — | print every command without running |
+
+### Verify before the real batch
+```bash
+python3 pipeline.py --url https://youtu.be/VIDEOID --clips 2 --dry-run   # prints exact commands
+python3 -c "import pipeline"                                             # imports clean
+```
+
+### The web command-builder
+`index.html` (GitHub Pages) — paste a link, pick options, copy the exact `pipeline.py` command. No processing in the browser; it just builds the command you run locally.
+
+### Batch the back catalog
+The 13 weekly reel plans in `mission-control/content-bank/reels/` each name a real SWS video and the command to run. Start with the Maryland→Google episode plan.

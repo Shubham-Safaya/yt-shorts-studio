@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>yt-shorts-studio — the repurposing factory</title>
+<meta name="description" content="Turn one long interview into ready-to-post 9:16 Shorts and Reels. Paste a link, get the exact command to run locally.">
+<style>
+:root{--bg:#0d0d10;--card:#16161b;--bdr:#26262e;--ink:#eceae4;--mut:#8a877e;--accent:#e8a33d}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font-family:-apple-system,'Segoe UI',sans-serif;line-height:1.55;padding:24px}
+main{max-width:680px;margin:0 auto}
+h1{font-size:1.6rem;margin-bottom:4px}.sub{color:var(--mut);margin-bottom:26px}
+label{display:block;font-size:.8rem;color:var(--mut);margin:14px 0 4px;text-transform:uppercase;letter-spacing:.05em}
+input,select{width:100%;padding:10px;border-radius:8px;border:1px solid var(--bdr);background:#0f0f13;color:var(--ink);font-size:15px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+pre{background:#000;border:1px solid var(--bdr);border-radius:8px;padding:14px;overflow:auto;font-size:13px;color:#9ae6b4;margin-top:20px;white-space:pre-wrap;word-break:break-all}
+button{background:var(--accent);color:#111;border:0;border-radius:8px;padding:9px 16px;font-weight:600;cursor:pointer;margin-top:10px}
+.card{background:var(--card);border:1px solid var(--bdr);border-radius:12px;padding:18px 20px;margin-top:16px}
+a{color:var(--accent)}code{background:#000;padding:1px 5px;border-radius:4px;font-size:.85em}
+.step{font-size:.9rem;color:var(--mut);margin:6px 0}
+</style>
+</head>
+<body>
+<main>
+<h1>yt-shorts-studio</h1>
+<p class="sub">One long interview → ready-to-post 9:16 Shorts + Reels. Paste a link, copy the command, run it locally.</p>
+
+<div class="card">
+  <label>YouTube URL</label>
+  <input id="url" placeholder="https://youtu.be/VIDEOID" value="">
+  <div class="row">
+    <div><label>Clips</label>
+      <select id="clips"><option>3</option><option>5</option><option>1</option><option>2</option><option>4</option></select></div>
+    <div><label>Captions</label>
+      <select id="style"><option value="captions-big">Big burned-in</option><option value="no-captions">None</option></select></div>
+  </div>
+  <div class="row">
+    <div><label>Crop</label>
+      <select id="crop"><option value="center">Centre</option><option value="face">Face-track</option></select></div>
+    <div><label>Whisper model</label>
+      <select id="model"><option>base</option><option>small</option><option>medium</option><option>tiny</option></select></div>
+  </div>
+  <button onclick="gen()">Generate command</button>
+  <pre id="cmd">python3 pipeline.py --url … </pre>
+  <button onclick="copyCmd()">Copy</button>
+</div>
+
+<div class="card">
+  <strong>Then, locally:</strong>
+  <p class="step">1. One-time setup: <code>pip install yt-dlp faster-whisper</code> and <code>brew install ffmpeg</code> (macOS) / <code>apt install ffmpeg</code> (Linux).</p>
+  <p class="step">2. Paste the command in the repo folder. It downloads, transcribes with word timestamps, scores highlights, cuts 9:16 clips with burned captions.</p>
+  <p class="step">3. Output lands in <code>output/&lt;video-id&gt;/</code> — the <code>short*.mp4</code> files plus <code>POSTING_CHECKLIST.md</code> with hooks, captions, and hashtags ready to paste.</p>
+  <p class="step">4. Upload manually to YouTube Shorts + Instagram Reels (no personal-account APIs exist). ~5 minutes.</p>
+  <p class="step"><strong>Bot-walled?</strong> Drop a word-timestamp JSON and use <code>--transcript words.json</code> to skip download + whisper.</p>
+</div>
+
+<p style="margin-top:20px;font-size:.85rem;color:var(--mut)">
+  <a href="https://github.com/Shubham-Safaya/yt-shorts-studio">Repo + README</a> ·
+  Part of the <a href="https://shubham-safaya.github.io/">Shubham Safaya</a> portfolio.
+  v1 (Actions-based plan generator) still lives in the repo for cloud-only planning.
+</p>
+</main>
+<script>
+function gen(){
+  const url = document.getElementById('url').value.trim() || 'https://youtu.be/VIDEOID';
+  const clips = document.getElementById('clips').value;
+  const style = document.getElementById('style').value;
+  const crop = document.getElementById('crop').value;
+  const model = document.getElementById('model').value;
+  let c = `python3 pipeline.py --url ${url} --clips ${clips} --style ${style}`;
+  if (crop !== 'center') c += ` --crop ${crop}`;
+  if (model !== 'base') c += ` --model ${model}`;
+  document.getElementById('cmd').textContent = c;
+}
+function copyCmd(){ navigator.clipboard.writeText(document.getElementById('cmd').textContent); }
+gen();
+</script>
+</body>
+</html>
