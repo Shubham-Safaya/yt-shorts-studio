@@ -13,6 +13,10 @@ on:
         description: "Also cut 9:16 clips (slower; downloaded as artifacts)"
         type: boolean
         default: false
+      visual_check:
+        description: "Let Claude look at frames before picking (needs ANTHROPIC_API_KEY)"
+        type: boolean
+        default: false
   push:
     paths:
       - "videos/queue.txt"
@@ -68,6 +72,7 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           MAKE_CLIPS: ${{ github.event.inputs.make_clips }}
+          VISUAL_CHECK: ${{ github.event.inputs.visual_check }}
         run: |
           while IFS= read -r url; do
             [ -z "$url" ] && continue

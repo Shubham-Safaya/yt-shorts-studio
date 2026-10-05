@@ -12,10 +12,13 @@ If an optional clipper step runs (ffmpeg), these timestamps drive the cuts.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -149,6 +152,7 @@ SYSTEM_PROMPT = (
     f"choose the {MAX_PICKS} BEST standalone clips (each must make sense alone and have a strong "
     "hook in the first 2 seconds). For each, write a punchy on-screen hook (<=70 chars) "
     "and a caption (1-2 lines + a question), then 6-8 relevant hashtags. "
+    "When a candidate has a `visual` review, prefer strong visuals and avoid crop_ok=false. "
     "Never use em dashes anywhere; use commas or periods."
 )
 
@@ -180,7 +184,8 @@ def picks_schema(n_candidates: int) -> dict:
 
 def build_claude_request(candidates: list[dict], title: str, model: str) -> dict:
     items = [{"i": i, "start": round(c["start"], 1), "end": round(c["end"], 1),
-              "text": c["text"][:600]} for i, c in enumerate(candidates)]
+              "text": c["text"][:600], **({"visual": c["visual"]} if c.get("visual") else {})}
+             for i, c in enumerate(candidates)]
     return {
         "model": model,
         "max_tokens": 16000,
@@ -220,28 +225,159 @@ def parse_claude_response(data: dict, candidates: list[dict]) -> list[dict] | No
     return out or None
 
 
-def claude_enhance(candidates: list[dict], title: str) -> list[dict] | None:
-    """Optional: if ANTHROPIC_API_KEY is set, let Claude pick the best clips and
-    write punchier hooks + captions. Returns enhanced picks, or None to fall back
-    to the heuristic. Pure stdlib HTTP so the Action needs no extra dependency."""
+def model_name() -> str:
+    return os.getenv("SHORTS_MODEL", "").strip() or DEFAULT_MODEL
+
+
+def call_claude(request: dict, label: str) -> dict | None:
+    """POST one Messages request. Pure stdlib HTTP so the Action needs no extra
+    dependency. Returns the response JSON, or None on any failure."""
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if not key or not candidates:
+    if not key:
         return None
-    model = os.getenv("SHORTS_MODEL", "").strip() or DEFAULT_MODEL
-    body = json.dumps(build_claude_request(candidates, title, model)).encode()
     req = urllib.request.Request(
-        CLAUDE_URL, data=body,
+        CLAUDE_URL, data=json.dumps(request).encode(),
         headers={"content-type": "application/json", "x-api-key": key,
                  "anthropic-version": "2023-06-01", "anthropic-beta": FALLBACK_BETA})
     try:
         with urllib.request.urlopen(req, timeout=300) as r:
-            return parse_claude_response(json.loads(r.read()), candidates)
+            return json.loads(r.read())
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "ignore")[:300]
-        print(f"(Claude enhance skipped: HTTP {e.code} {detail})")
+        print(f"({label} skipped: HTTP {e.code} {detail})")
     except Exception as e:
-        print(f"(Claude enhance skipped: {e})")
+        print(f"({label} skipped: {e})")
     return None
+
+
+def claude_enhance(candidates: list[dict], title: str) -> list[dict] | None:
+    """Optional: if ANTHROPIC_API_KEY is set, let Claude pick the best clips and
+    write punchier hooks + captions. Returns enhanced picks, or None to fall back
+    to the heuristic."""
+    if not os.getenv("ANTHROPIC_API_KEY", "").strip() or not candidates:
+        return None
+    data = call_claude(build_claude_request(candidates, title, model_name()), "Claude enhance")
+    if data is None:
+        return None
+    try:
+        return parse_claude_response(data, candidates)
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"(Claude enhance skipped: {e})")
+        return None
+
+
+# ── Optional visual check (needs the video file + ANTHROPIC_API_KEY) ──
+# Adapted from the multimodal video moment finder in awesome-llm-apps, using
+# Claude's vision on a few sampled frames instead of an embedding index: it
+# judges how each candidate LOOKS and whether clip.py's centered 9:16 crop
+# keeps the speaker in frame, which a transcript cannot tell you.
+
+FRAME_POSITIONS = (0.2, 0.5, 0.8)  # sample points inside each candidate window
+VISUAL_SYSTEM = (
+    "You review frames from candidate moments of a long video that will be cut into "
+    "vertical 9:16 Shorts with a CENTERED crop (the middle ~56% of a 16:9 frame). "
+    "For each candidate, score visual strength 0-10 (a clear, expressive, well-lit "
+    "speaker or striking visual scores high; slides with small text, black or static "
+    "frames, or an empty set score low). Set crop_ok to false if a centered vertical "
+    "crop would cut off the main subject. Keep each note under 15 words."
+)
+
+
+def extract_frames(video: Path, cand: dict, out_dir: Path) -> list[Path]:
+    """Grab small JPEG frames inside one candidate window with ffmpeg."""
+    frames = []
+    for k, pos in enumerate(FRAME_POSITIONS):
+        t = cand["start"] + (cand["end"] - cand["start"]) * pos
+        out = out_dir / f"{int(cand['start'])}_{k}.jpg"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", str(video),
+                        "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "5", str(out)], check=False)
+        if out.exists() and out.stat().st_size > 0:
+            frames.append(out)
+    return frames
+
+
+def visual_schema(n_candidates: int) -> dict:
+    return {
+        "type": "object",
+        "properties": {"moments": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "i": {"type": "integer", "enum": list(range(n_candidates))},
+                "visual_score": {"type": "integer"},
+                "crop_ok": {"type": "boolean"},
+                "note": {"type": "string"},
+            },
+            "required": ["i", "visual_score", "crop_ok", "note"],
+            "additionalProperties": False,
+        }}},
+        "required": ["moments"],
+        "additionalProperties": False,
+    }
+
+
+def build_visual_request(frames_by_i: dict[int, list[Path]], candidates: list[dict], model: str) -> dict:
+    content = []
+    for i, frames in sorted(frames_by_i.items()):
+        c = candidates[i]
+        content.append({"type": "text", "text": f"Candidate {i} ({fmt(c['start'])}-{fmt(c['end'])}):"})
+        for f in frames:
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg",
+                "data": base64.b64encode(f.read_bytes()).decode()}})
+    content.append({"type": "text", "text": "Score every candidate above."})
+    return {
+        "model": model,
+        "max_tokens": 16000,
+        "system": VISUAL_SYSTEM,
+        "messages": [{"role": "user", "content": content}],
+        "output_config": {"effort": "low",
+                          "format": {"type": "json_schema", "schema": visual_schema(len(candidates))}},
+        "fallbacks": "default",
+    }
+
+
+def parse_visual_response(data: dict, n_candidates: int) -> dict[int, dict] | None:
+    if data.get("stop_reason") in ("refusal", "max_tokens"):
+        print(f"(Visual check skipped: stop_reason={data.get('stop_reason')})")
+        return None
+    text = next((b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"), "")
+    out = {}
+    for m in json.loads(text).get("moments", []):
+        i = m.get("i")
+        if isinstance(i, int) and 0 <= i < n_candidates:
+            out[i] = {"score": max(0, min(10, int(m.get("visual_score", 0)))),
+                      "crop_ok": bool(m.get("crop_ok", True)), "note": str(m.get("note", "")).strip()}
+    return out or None
+
+
+def visual_check(video: Path, candidates: list[dict]) -> int:
+    """Attach c['visual'] to candidates. Returns how many were scored."""
+    if not candidates or not video.exists() or not os.getenv("ANTHROPIC_API_KEY", "").strip():
+        return 0
+    with tempfile.TemporaryDirectory() as tmp:
+        frames_by_i = {i: f for i, c in enumerate(candidates) if (f := extract_frames(video, c, Path(tmp)))}
+        if not frames_by_i:
+            print("(Visual check skipped: no frames extracted)")
+            return 0
+        data = call_claude(build_visual_request(frames_by_i, candidates, model_name()), "Visual check")
+    if data is None:
+        return 0
+    try:
+        scores = parse_visual_response(data, len(candidates))
+    except (ValueError, KeyError, TypeError) as e:
+        print(f"(Visual check skipped: {e})")
+        return 0
+    for i, v in (scores or {}).items():
+        candidates[i]["visual"] = v
+    return len(scores or {})
+
+
+def visual_adjusted(w: dict) -> float:
+    """Heuristic score nudged by the visual check, when it ran."""
+    v = w.get("visual")
+    if not v:
+        return w["score"]
+    return w["score"] + (v["score"] - 5) * 1.5 - (0 if v["crop_ok"] else 8)
 
 
 def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[dict], smart: bool) -> str:
@@ -263,6 +399,9 @@ def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[di
             "",
             f"**Hook (first 2s, big text):** {w.get('hook') or hook_line(w['text'])}",
             "",
+            *([f"**Visual:** {w['visual']['score']}/10, "
+               f"{'centered 9:16 crop keeps the subject' if w['visual']['crop_ok'] else 'centered crop cuts the subject, reframe by hand'}. "
+               f"{w['visual']['note']}", ""] if w.get("visual") else []),
             f"> {w['text']}",
             "",
             "**Caption (paste to Reels + Shorts):**",
@@ -337,11 +476,18 @@ def main():
     for w in wins:
         w["score"] = score(w)
     ranked = sorted(wins, key=lambda w: w["score"], reverse=True)
+    top = ranked[:10]
+
+    # Optional: look at frames from the top candidates (needs SHORTS_VIDEO).
+    video = os.getenv("SHORTS_VIDEO", "").strip()
+    visual = visual_check(Path(video), top) if video else 0
+    if visual:
+        print(f"Visual check scored {visual} candidates.")
 
     # Optional: let Claude choose from the top candidates and write the copy.
-    smart_picks = claude_enhance(ranked[:10], title)
+    smart_picks = claude_enhance(top, title)
     smart = smart_picks is not None
-    picks = smart_picks if smart else ranked[:5]
+    picks = smart_picks if smart else sorted(top, key=visual_adjusted, reverse=True)[:5]
     picks.sort(key=lambda w: w["start"])  # chronological in the plan
 
     plan = build_plan(video_id, title, url, dur, picks, smart)

@@ -7,6 +7,8 @@
 #   2. Else fetch captions with yt-dlp, passing --cookies cookies.txt when present
 #      (set the YOUTUBE_COOKIES secret to defeat the bot wall).
 # Env: MAKE_CLIPS=true to also cut 9:16 clips. ANTHROPIC_API_KEY for best clips.
+#      VISUAL_CHECK=true (with ANTHROPIC_API_KEY) to let Claude look at frames from
+#      the top candidates before picking: visual strength + whether the 9:16 crop works.
 set -uo pipefail
 
 url="$1"
@@ -38,9 +40,20 @@ else
   [ -z "$vtt" ] && vtt=/dev/null
 fi
 
-python analyze.py "$vtt" work/meta.json reviews
+# Download the video once, before analysis, if clips or the visual check need it.
+# Clips need 1080p; the visual check alone is fine at 480p.
+want_visual=false
+[ "${VISUAL_CHECK:-false}" = "true" ] && [ -n "${ANTHROPIC_API_KEY:-}" ] && want_visual=true
+if [ "${MAKE_CLIPS:-false}" = "true" ] || [ "$want_visual" = "true" ]; then
+  height=480; [ "${MAKE_CLIPS:-false}" = "true" ] && height=1080
+  python -m yt_dlp $COOKIES -f "bv*[height<=$height]+ba/b[height<=$height]" --merge-output-format mp4 \
+    -o "work/$id.mp4" "$url" 2>/dev/null || echo "   (video download failed; continuing without it)"
+fi
 
-if [ "${MAKE_CLIPS:-false}" = "true" ] && [ -f "reviews/$id.clips.json" ]; then
-  python -m yt_dlp $COOKIES -f "bv*[height<=1080]+ba/b[height<=1080]" -o "work/$id.mp4" "$url" 2>/dev/null || true
-  [ -f "work/$id.mp4" ] && python clip.py "$id"
+video=""
+[ "$want_visual" = "true" ] && [ -f "work/$id.mp4" ] && video="work/$id.mp4"
+SHORTS_VIDEO="$video" python analyze.py "$vtt" work/meta.json reviews
+
+if [ "${MAKE_CLIPS:-false}" = "true" ] && [ -f "reviews/$id.clips.json" ] && [ -f "work/$id.mp4" ]; then
+  python clip.py "$id"
 fi

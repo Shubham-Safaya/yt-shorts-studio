@@ -4,7 +4,7 @@ Turn a long YouTube video (yours) into a **Shorts/Reels plan** — best moments,
 
 ## How to use it
 
-**Option A — one-off (fastest):** Actions tab → **YouTube to Shorts** → *Run workflow* → paste a YouTube URL. Tick *make clips* if you also want cut 9:16 videos (downloaded as a run artifact). A `reviews/<id>.md` is committed with the plan.
+**Option A — one-off (fastest):** Actions tab → **YouTube to Shorts** → *Run workflow* → paste a YouTube URL. Tick *make clips* if you also want cut 9:16 videos (downloaded as a run artifact). A `reviews/<id>.md` is committed with the plan. Tick *visual check* to have Claude look at frames from the top candidate moments before picking: each clip in the plan then shows a visual score and whether the centered 9:16 crop keeps you in frame (needs `ANTHROPIC_API_KEY`; downloads a 480p copy, or reuses the 1080p one when cutting clips).
 
 **Option B — queue:** add your video URL to [`videos/queue.txt`](videos/queue.txt) and push. Every new link is processed and its plan committed.
 
