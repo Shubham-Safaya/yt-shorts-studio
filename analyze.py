@@ -6,7 +6,7 @@ metadata, finds the strongest ~30-50s moments, and writes a "Shorts Plan":
 ready-to-cut clip timestamps with a hook, a caption, and hashtags for both
 Instagram Reels and YouTube Shorts. Also writes a short review of the video.
 
-Pure standard library. No API key. Built for the user's OWN videos.
+Pure standard library. Claude is optional (ANTHROPIC_API_KEY). Built for the user's OWN videos.
 If an optional clipper step runs (ffmpeg), these timestamps drive the cuts.
 """
 
@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -138,6 +139,87 @@ def caption(text: str, idx: int) -> str:
     return f"{hook}\n\n{cta}\n\n{tags}"
 
 
+CLAUDE_URL = "https://api.anthropic.com/v1/messages"
+DEFAULT_MODEL = "claude-opus-5-5"
+FALLBACK_BETA = "server-side-fallback-2026-07-01"
+MAX_PICKS = 5
+SYSTEM_PROMPT = (
+    "You are an elite short-form video editor who turns long talks into viral "
+    "Shorts/Reels for a tech-career creator. From the candidate transcript moments, "
+    f"choose the {MAX_PICKS} BEST standalone clips (each must make sense alone and have a strong "
+    "hook in the first 2 seconds). For each, write a punchy on-screen hook (<=70 chars) "
+    "and a caption (1-2 lines + a question), then 6-8 relevant hashtags. "
+    "Never use em dashes anywhere; use commas or periods."
+)
+
+
+def picks_schema(n_candidates: int) -> dict:
+    """JSON schema for Claude's reply. `i` is limited to real candidate indices."""
+    return {
+        "type": "object",
+        "properties": {
+            "picks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "i": {"type": "integer", "enum": list(range(n_candidates))},
+                        "hook": {"type": "string"},
+                        "caption": {"type": "string"},
+                        "hashtags": {"type": "string"},
+                    },
+                    "required": ["i", "hook", "caption", "hashtags"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["picks"],
+        "additionalProperties": False,
+    }
+
+
+def build_claude_request(candidates: list[dict], title: str, model: str) -> dict:
+    items = [{"i": i, "start": round(c["start"], 1), "end": round(c["end"], 1),
+              "text": c["text"][:600]} for i, c in enumerate(candidates)]
+    return {
+        "model": model,
+        "max_tokens": 16000,
+        "system": SYSTEM_PROMPT,
+        "messages": [{"role": "user",
+                      "content": f"Video: {title}\nCandidates:\n{json.dumps(items, ensure_ascii=False)}"}],
+        "output_config": {
+            "effort": "medium",
+            "format": {"type": "json_schema", "schema": picks_schema(len(candidates))},
+        },
+        # A safety decline is re-run on Anthropic's recommended fallback model.
+        "fallbacks": "default",
+    }
+
+
+def parse_claude_response(data: dict, candidates: list[dict]) -> list[dict] | None:
+    """Turn an API response into picks, or None to fall back to the heuristic."""
+    stop = data.get("stop_reason")
+    if stop in ("refusal", "max_tokens"):
+        print(f"(Claude enhance skipped: stop_reason={stop})")
+        return None
+    text = next((b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"), "")
+    parsed = json.loads(text)  # structured outputs guarantee valid JSON for the schema
+    out, seen = [], set()
+    for p in parsed.get("picks", []):
+        i = p.get("i")
+        if not isinstance(i, int) or not 0 <= i < len(candidates) or i in seen:
+            continue
+        seen.add(i)
+        cap = p.get("caption", "").strip()
+        tags = p.get("hashtags", "").strip()
+        out.append({**candidates[i], "hook": p.get("hook", "").strip(),
+                    "caption": (cap + ("\n\n" + tags if tags else "")).strip()})
+        if len(out) == MAX_PICKS:
+            break
+    out.sort(key=lambda w: w["start"])
+    return out or None
+
+
 def claude_enhance(candidates: list[dict], title: str) -> list[dict] | None:
     """Optional: if ANTHROPIC_API_KEY is set, let Claude pick the best clips and
     write punchier hooks + captions. Returns enhanced picks, or None to fall back
@@ -145,46 +227,21 @@ def claude_enhance(candidates: list[dict], title: str) -> list[dict] | None:
     key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not key or not candidates:
         return None
-    model = os.getenv("SHORTS_MODEL", "claude-opus-4-8").strip()
-    items = [{"i": i, "start": round(c["start"], 1), "end": round(c["end"], 1),
-              "text": c["text"][:600]} for i, c in enumerate(candidates)]
-    system = (
-        "You are an elite short-form video editor who turns long talks into viral "
-        "Shorts/Reels for a tech-career creator. From the candidate transcript moments, "
-        "choose the 5 BEST standalone clips (each must make sense alone and have a strong "
-        "hook in the first 2 seconds). For each, write a punchy on-screen hook (<=70 chars) "
-        "and a caption (1-2 lines + a question), then 6-8 relevant hashtags. "
-        "Never use em dashes anywhere; use commas or periods. "
-        'Return ONLY JSON: {"picks":[{"i":<index>,"hook":"...","caption":"...","hashtags":"#a #b"}]}'
-    )
-    body = json.dumps({
-        "model": model, "max_tokens": 1500, "system": system,
-        "messages": [{"role": "user",
-                      "content": f"Video: {title}\nCandidates:\n{json.dumps(items, ensure_ascii=False)}"}],
-    }).encode()
+    model = os.getenv("SHORTS_MODEL", "").strip() or DEFAULT_MODEL
+    body = json.dumps(build_claude_request(candidates, title, model)).encode()
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages", data=body,
+        CLAUDE_URL, data=body,
         headers={"content-type": "application/json", "x-api-key": key,
-                 "anthropic-version": "2023-06-01"})
+                 "anthropic-version": "2023-06-01", "anthropic-beta": FALLBACK_BETA})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            data = json.loads(r.read())
-        if data.get("stop_reason") == "refusal":
-            return None
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-        parsed = json.loads(re.search(r"\{.*\}", text, re.S).group(0))
-        out = []
-        for p in parsed.get("picks", [])[:5]:
-            c = candidates[int(p["i"])]
-            cap = p.get("caption", "").strip()
-            tags = p.get("hashtags", "").strip()
-            out.append({**c, "hook": p.get("hook", "").strip(),
-                        "caption": (cap + ("\n\n" + tags if tags else "")).strip()})
-        out.sort(key=lambda w: w["start"])
-        return out or None
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return parse_claude_response(json.loads(r.read()), candidates)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "ignore")[:300]
+        print(f"(Claude enhance skipped: HTTP {e.code} {detail})")
     except Exception as e:
         print(f"(Claude enhance skipped: {e})")
-        return None
+    return None
 
 
 def build_plan(video_id: str, title: str, url: str, dur_s: float, picks: list[dict], smart: bool) -> str:

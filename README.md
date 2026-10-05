@@ -12,7 +12,7 @@ Turn a long YouTube video (yours) into a **Shorts/Reels plan** — best moments,
 
 ## Best-quality mode (optional, recommended)
 
-Add an `ANTHROPIC_API_KEY` repo secret (Settings → Secrets → Actions). When present, **Claude picks the best clips and writes the hooks + captions** (no em dashes) instead of the built-in heuristic — meaningfully better shorts. Without the key it still works, just heuristically. Model override via the `SHORTS_MODEL` env (default `claude-opus-4-8`).
+Add an `ANTHROPIC_API_KEY` repo secret (Settings → Secrets → Actions). When present, **Claude picks the best clips and writes the hooks + captions** (no em dashes) instead of the built-in heuristic — meaningfully better shorts. Without the key it still works, just heuristically. Model override via the `SHORTS_MODEL` env (default `claude-opus-5-5`). Claude returns JSON validated against a schema, and a safety decline is retried on Anthropic's recommended fallback model.
 
 ## What you get, per video
 
